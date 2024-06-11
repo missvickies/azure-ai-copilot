@@ -1,12 +1,22 @@
 require('dotenv').config();
 const { MongoClient } = require('mongodb');
+const { OpenAIClient, AzureKeyCredential} = require("@azure/openai");
 
-async function main() {    
-    const client = new MongoClient(process.env.MONGODB_URI);
+// set up the MongoDB client
+// const dbClient = new MongoClient(process.env.AZURE_COSMOSDB_CONNECTION_STRING);
+const dbClient = new MongoClient(process.env.MONGODB_URI, {
+    tlsAllowInvalidCertificates: true
+});
+// set up the Azure OpenAI client 
+const embeddingsDeploymentName = "embeddings";
+const aoaiClient = new OpenAIClient("https://" + process.env.AZURE_OPENAI_API_INSTANCE_NAME + ".openai.azure.com/", 
+                    new AzureKeyCredential(process.env.AZURE_OPENAI_API_KEY));
+
+async function main() {
     try {
-        await client.connect();
+        await dbClient.connect();
         console.log('Connected to MongoDB');
-        const db = client.db('cosmic_works');
+        const db = dbClient.db('cosmic_works');
 
         // Load product data
         console.log('Loading product data')
@@ -28,33 +38,79 @@ async function main() {
         );
         console.log(`${result.insertedCount} products inserted`);
 
-        // Load customer and sales data
-        console.log('Retrieving combined Customer/Sales data');
-        const customerCollection = db.collection('customers');
-        const salesCollection = db.collection('sales');
-        const custSalesRawData = "https://cosmosdbcosmicworks.blob.core.windows.net/cosmic-works-small/customer.json";
-        const custSalesData = (await (await fetch(custSalesRawData)).json())
-                                .map(custSales => cleanData(custSales));   
-        
-        console.log("Split customer and sales data");
-        const customerData = custSalesData.filter(cust => cust["type"] === "customer");
-        const salesData = custSalesData.filter(sales => sales["type"] === "salesOrder");
-        
-        console.log("Loading customer data");
-        await customerCollection.deleteMany({});
-        result = await customerCollection.insertMany(customerData);
-        console.log(`${result.insertedCount} customers inserted`);
-        
-        console.log("Loading sales data");
-        await salesCollection.deleteMany({});
-        result = await salesCollection.insertMany(salesData);
-        console.log(`${result.insertedCount} sales inserted`);
-        
+        await addCollectionContentVectorField(db, 'products');
+       
     } catch (err) {
         console.error(err);
     } finally {
-        await client.close();
+        await dbClient.close();
         console.log('Disconnected from MongoDB');
+    }
+}
+
+async function generateEmbeddings(text) {
+    const embeddings = await aoaiClient.getEmbeddings(embeddingsDeploymentName, text);
+    // Rest period to avoid rate limiting on Azure OpenAI  
+    await new Promise(resolve => setTimeout(resolve, 500));
+    return embeddings.data[0].embedding;
+}
+
+async function addCollectionContentVectorField(db, collectionName) {
+    const collection = db.collection(collectionName); 
+    const docs = await collection.find({}).toArray();
+    const bulkOperations = [];
+    console.log(`Generating content vectors for ${docs.length} documents in ${collectionName} collection`);
+    for (let i=0; i<docs.length; i++) {
+        const doc = docs[i];
+        // do not include contentVector field in the content to be embedded
+        if ('contentVector' in doc) {
+            delete doc['contentVector'];
+        }
+        const content = JSON.stringify(doc);
+        const contentVector = await generateEmbeddings(content);
+        bulkOperations.push({
+            updateOne: {
+                filter: { '_id': doc['_id'] },
+                update: { '$set': { 'contentVector': contentVector } },
+                upsert: true
+            }
+        });
+        //output progress every 25 documents
+        if ((i+1) % 25 === 0 || i === docs.length-1) {          
+            console.log(`Generated ${i+1} content vectors of ${docs.length} in the ${collectionName} collection`);
+        }
+    }
+    if (bulkOperations.length > 0) {
+        console.log(`Persisting the generated content vectors in the ${collectionName} collection using bulkWrite upserts`);
+        await collection.bulkWrite(bulkOperations);
+        console.log(`Finished persisting the content vectors to the ${collectionName} collection`);
+    }
+
+    //check to see if the vector index already exists on the collection
+    console.log(`Checking if vector index exists in the ${collectionName} collection`)
+    const vectorIndexExists = await collection.indexExists('VectorSearchIndex');
+    if (!vectorIndexExists) {
+        await db.command({
+            "createIndexes": collectionName,
+            "indexes": [
+              {
+                "name": "VectorSearchIndex",
+                "key": {
+                  "contentVector": "cosmosSearch"
+                },
+                "cosmosSearchOptions": {                  
+                  "kind": "vector-ivf",
+                  "numLists": 1,
+                  "similarity": "COS",
+                  "dimensions": 1536
+                }
+              }
+            ]
+        });
+        console.log(`Created vector index on contentVector field on ${collectionName} collection`);
+    }
+    else {
+        console.log(`Vector index already exists on contentVector field in the ${collectionName} collection`);
     }
 }
 
@@ -66,6 +122,7 @@ function cleanData(obj) {
     cleaned["_id"] = cleaned["id"];
     delete cleaned["id"];
     return cleaned;
-}  
+}
+
 
 main().catch(console.error);
